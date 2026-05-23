@@ -3,7 +3,7 @@
 
 use order_book::{
     order_book::{OrderBook, OrderBookError, OrderEvent},
-    types::{Account, Amount, AssetId, OrderKind, OrderId, Side, Tif},
+    types::{Account, AccountError, Amount, AssetId, OrderKind, OrderId, Side, Tif},
 };
 use rust_decimal::Decimal;
 
@@ -321,6 +321,223 @@ fn ioc_limit_sell_partial_fill_refunds_remaining_base() {
     assert!(
         maker.is_none(),
         "maker buy fully filled against first slice"
+    );
+}
+
+#[test]
+fn update_order_rejected_when_extra_collateral_not_available() {
+    let mut book = mk_book_with_accounts::<2>(dec(10), dec(1_000));
+
+    book.place_order(
+        1,
+        AssetId::Btc,
+        Side::Buy,
+        OrderKind::Limit { price: 50 },
+        dec(500),
+        None,
+    )
+    .expect("resting buy");
+
+    let err = book
+        .update_order(1, 1, 50, dec(1_200))
+        .expect_err("insufficient USDC for larger reserve");
+
+    assert_eq!(
+        err,
+        OrderBookError::Account(AccountError::InsufficientBalance)
+    );
+
+    let o = book.order(1).expect("order still resting");
+    assert_eq!(o.amount(), dec(500));
+    assert_eq!(
+        book.account(1).expect("account").balance(AssetId::Usdc),
+        dec(500)
+    );
+}
+
+#[test]
+fn update_order_reducing_buy_size_refunds_quote_collateral() {
+    let mut book = mk_book_with_accounts::<1>(dec(0), dec(10_000));
+
+    book.place_order(
+        1,
+        AssetId::Btc,
+        Side::Buy,
+        OrderKind::Limit { price: 40 },
+        dec(4_000),
+        None,
+    )
+    .expect("resting buy");
+
+    let events = book
+        .update_order(1, 1, 40, dec(1_000))
+        .expect("shrink buy budget");
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            OrderEvent::Updated {
+                order_id: 1,
+                amount_rested,
+                ..
+            } if *amount_rested == dec(1_000)
+        )),
+        "expected Updated with full remainder rested, got {events:?}"
+    );
+
+    let acc = book.account(1).expect("account");
+    assert_eq!(acc.balance(AssetId::Usdc), dec(10_000) - dec(1_000));
+    assert_eq!(book.order(1).expect("still resting").amount(), dec(1_000));
+}
+
+#[test]
+fn update_order_reducing_sell_size_refunds_base_collateral() {
+    let mut book = mk_book_with_accounts::<1>(dec(100), dec(0));
+
+    book.place_order(
+        1,
+        AssetId::Btc,
+        Side::Sell,
+        OrderKind::Limit { price: 120 },
+        dec(50),
+        None,
+    )
+    .expect("resting sell");
+
+    book.update_order(1, 1, 120, dec(10)).expect("shrink sell");
+
+    let acc = book.account(1).expect("account");
+    assert_eq!(acc.balance(AssetId::Btc), dec(100) - dec(10));
+    assert_eq!(book.order(1).expect("still resting").amount(), dec(10));
+}
+
+#[test]
+fn update_order_owner_mismatch_is_rejected() {
+    let mut book = mk_book_with_accounts::<2>(dec(10), dec(10_000));
+
+    book.place_order(
+        1,
+        AssetId::Btc,
+        Side::Buy,
+        OrderKind::Limit { price: 50 },
+        dec(1_000),
+        None,
+    )
+    .expect("resting buy");
+
+    let err = book
+        .update_order(2, 1, 55, dec(1_000))
+        .expect_err("wrong owner");
+
+    assert_eq!(err, OrderBookError::OrderOwnerMismatch);
+}
+
+#[test]
+fn update_order_rematches_as_taker_keeps_order_id_and_emits_updated() {
+    let mut book = mk_book_with_accounts::<2>(dec(10), dec(1_000_000));
+
+    book.place_order(
+        2,
+        AssetId::Btc,
+        Side::Sell,
+        OrderKind::Limit { price: 100 },
+        dec(1),
+        None,
+    )
+    .expect("resting sell");
+
+    book.place_order(
+        1,
+        AssetId::Btc,
+        Side::Buy,
+        OrderKind::Limit { price: 80 },
+        dec(50_000),
+        None,
+    )
+    .expect("deep bid");
+
+    assert_eq!(book.order(2).expect("buy").amount(), dec(50_000));
+
+    let events = book
+        .update_order(1, 2, 200, dec(300))
+        .expect("amend bid to lift ask");
+
+    assert!(
+        events.iter().any(|e| matches!(e, OrderEvent::Matched { .. })),
+        "expected match after amend, got {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            OrderEvent::Filled { order_id } if *order_id == 1
+        )),
+        "maker sell fully filled"
+    );
+
+    let updated = events.iter().find_map(|e| match e {
+        OrderEvent::Updated {
+            order_id,
+            price,
+            amount,
+            amount_rested,
+        } => Some((*order_id, *price, *amount, *amount_rested)),
+        _ => None,
+    });
+    assert_eq!(
+        updated,
+        Some((2, 200, dec(300), dec(200))),
+        "pre-match amount 300 USDC, 100 USDC spent on fill, 200 USDC rested"
+    );
+
+    assert_eq!(book.order(2).expect("same id").amount(), dec(200));
+    assert!(
+        book.account(1).expect("buyer").open_orders().contains(&2),
+        "open-order set tracks resting amend"
+    );
+}
+
+#[test]
+fn update_order_full_fill_emits_updated_with_zero_rested() {
+    let mut book = mk_book_with_accounts::<2>(dec(10), dec(1_000_000));
+
+    book.place_order(
+        2,
+        AssetId::Btc,
+        Side::Sell,
+        OrderKind::Limit { price: 100 },
+        dec(1),
+        None,
+    )
+    .expect("resting sell");
+
+    book.place_order(
+        1,
+        AssetId::Btc,
+        Side::Buy,
+        OrderKind::Limit { price: 80 },
+        dec(10_000),
+        None,
+    )
+    .expect("deep bid");
+
+    let events = book
+        .update_order(1, 2, 150, dec(100))
+        .expect("lift ask with exact budget");
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            OrderEvent::Updated {
+                amount_rested,
+                ..
+            } if *amount_rested == Amount::ZERO
+        )),
+        "fully filled taker: nothing rests"
+    );
+    assert!(book.order(2).is_none());
+    assert!(
+        book.account(1).expect("buyer").open_orders().is_empty(),
+        "expected no open orders after full fill"
     );
 }
 

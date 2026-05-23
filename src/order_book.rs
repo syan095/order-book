@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::match_engine::{MatchEngine, MatchEngineError, MatchResult};
 use crate::types::{
     Account, AccountError, AccountId, Amount, AssetId, Order, OrderBookSide, OrderId, OrderKind,
-    STABLE_ASSET_ID, Side, Tif,
+    Price, STABLE_ASSET_ID, Side, Tif,
 };
 
 /// Things that happened to one or more orders while processing a submission (append-only log).
@@ -23,6 +23,15 @@ pub enum OrderEvent {
     /// A resting order id is fully done (fully filled as maker, or taker fully consumed with no
     /// remainder that will rest).
     Filled { order_id: OrderId },
+    /// A resting limit was amended (same `order_id`), removed, re-run through matching, then any
+    /// remainder rested again. `amount` is the post-update working size before matching; `amount_rested`
+    /// is what remained on the book (zero if fully filled as taker).
+    Updated {
+        order_id: OrderId,
+        price: Price,
+        amount: Amount,
+        amount_rested: Amount,
+    },
 }
 
 /// Errors surfaced when routing an order through accounts and the matching engine.
@@ -36,6 +45,7 @@ pub enum OrderBookError {
     OrderOwnerMismatch,
     InvalidAsset,
     OrderAmountTooSmall,
+    CannotUpdateNonLimitOrder,
 }
 
 /// In-memory central limit order book: resting bids/asks, monotonic order ids, per-account
@@ -224,6 +234,88 @@ impl OrderBook {
         }])
     }
 
+    /// Replaces price and size of a resting limit owned by `account_id`, keeping `order_id`.
+    /// Adjusts collateral by the signed difference vs the previous reservation; fails if the extra
+    /// debit would breach balance. The order is removed from the book and processed like a new
+    /// aggressive order (matching), then any GTC remainder rests again at the new limit.
+    pub fn update_order(
+        &mut self,
+        account_id: AccountId,
+        order_id: OrderId,
+        new_price: Price,
+        new_amount: Amount,
+    ) -> Result<Vec<OrderEvent>, OrderBookError> {
+        let old = self
+            .orders
+            .get(&order_id)
+            .ok_or(OrderBookError::OrderNotFound)?
+            .clone();
+
+        if old.account_id() != account_id {
+            return Err(OrderBookError::OrderOwnerMismatch);
+        }
+
+        let OrderKind::Limit { .. } = old.kind() else {
+            return Err(OrderBookError::CannotUpdateNonLimitOrder);
+        };
+
+        validate_asset(old.asset_id())?;
+
+        let collateral_asset_id = collateral_asset(old.side(), old.asset_id());
+        if new_amount < collateral_asset_id.min_amount() {
+            return Err(OrderBookError::OrderAmountTooSmall);
+        }
+
+        let (_, old_collateral) = collateral_for_order(&old);
+        let collateral_delta = new_amount - old_collateral;
+
+        if collateral_delta != Amount::ZERO {
+            self.accounts
+                .get_mut(&account_id)
+                .ok_or(OrderBookError::AccountNotFound)?
+                .try_settle(collateral_asset_id, -collateral_delta)
+                .map_err(OrderBookError::Account)?;
+        }
+
+        self.remove_resting_order(&old);
+
+        let mut updated = Order::new(
+            order_id,
+            account_id,
+            old.asset_id(),
+            old.side(),
+            OrderKind::Limit { price: new_price },
+            new_amount,
+            Tif::GoodUntilCancelled,
+        );
+
+        match self.process_order(&mut updated) {
+            Ok(mut events) => {
+                let amount_rested = self
+                    .orders
+                    .get(&order_id)
+                    .map(|o| o.amount())
+                    .unwrap_or(Amount::ZERO);
+                events.push(OrderEvent::Updated {
+                    order_id,
+                    price: new_price,
+                    amount: new_amount,
+                    amount_rested,
+                });
+                Ok(events)
+            }
+            Err(err) => {
+                let _ = self.release_for_order(&updated);
+                let _ = self
+                    .accounts
+                    .get_mut(&account_id)
+                    .map(|acc| acc.try_settle(collateral_asset_id, -old_collateral));
+                self.restore_resting_limit(&old);
+                Err(err)
+            }
+        }
+    }
+
     pub fn order(&self, order_id: OrderId) -> Option<&Order> {
         self.orders.get(&order_id)
     }
@@ -277,6 +369,20 @@ impl OrderBook {
         if let Some(account) = self.accounts.get_mut(&account_id) {
             account.register_open_order(order_id);
         }
+    }
+
+    fn restore_resting_limit(&mut self, order: &Order) {
+        let OrderKind::Limit { price } = order.kind() else {
+            return;
+        };
+
+        let oid = order.id();
+        match order.side() {
+            Side::Buy => self.buys.add_limit_order(price, oid),
+            Side::Sell => self.sells.add_limit_order(price, oid),
+        }
+        self.register_open_order_for_account(order.account_id(), oid);
+        self.orders.insert(oid, order.clone());
     }
 
     /// Credits collateral back to the owner's balance.
